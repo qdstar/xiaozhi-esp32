@@ -1,0 +1,21 @@
+{
+    "type": "lxp-esp32-s3",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "lxp-esp32-s3",
+            "sdkconfig_append": [
+                "CONFIG_BOARD_TYPE_LXP_ESP32_S3=y",
+                "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/16m.csv\"",
+                "CONFIG_OTA_URL=\"https://xiao2.complote.com/xiaozhi/ota/\"",
+                "CONFIG_SPIRAM=y",
+                "CONFIG_SPIRAM_MODE_OCT=y",
+                "CONFIG_SPIRAM_SPEED_80M=y",
+                "CONFIG_USE_AFE_WAKE_WORD=y",
+                "CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y",
+                "CONFIG_WAKE_WORD_DETECTION_IN_LISTENING=y"
+            ]
+        }
+    ]
+}

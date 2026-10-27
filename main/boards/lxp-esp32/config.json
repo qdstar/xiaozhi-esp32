@@ -1,0 +1,20 @@
+{
+    "type": "lxp-esp32",
+    "target": "esp32",
+    "builds": [
+        {
+            "name": "lxp-esp32",
+            "sdkconfig_append": [
+                "CONFIG_BOARD_TYPE_LXP_ESP32=y",
+                "CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/4m.csv\"",
+                "CONFIG_OTA_URL=\"https://xiao2.complote.com/xiaozhi/ota/\"",
+                "CONFIG_WAKE_WORD_DISABLED=y"
+            ]
+        }
+    ],
+    "notes": {
+        "wake_word_display": "你好小二",
+        "s3_recommended": "ESP32-S3+PSRAM: enable CONFIG_USE_CUSTOM_WAKE_WORD + barge-in while speaking; see README"
+    }
+}

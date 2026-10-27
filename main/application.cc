@@ -3,6 +3,7 @@
 #include "assets/lang_config.h"
 #include "audio_codec.h"
 #include "board.h"
+#include "cjson_utils.h"
 #include "display.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
@@ -71,6 +72,8 @@ void Application::Initialize() {
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
+    ESP_LOGI(TAG, "After board/audio init");
+    SystemInfo::PrintHeapStats();
 
     AudioServiceCallbacks callbacks;
     callbacks.on_send_queue_available = [this]() {
@@ -243,6 +246,17 @@ void Application::Run() {
                     // MAIN_EVENT_SEND_AUDIO event would ever be triggered again.
                     while (audio_service_.PopPacketFromSendQueue())
                         ;
+                    // 发送失败后如果停在聆听，唤醒词是关的，下一句「你好小智」不会再连服务器。
+                    ESP_LOGW(TAG, "语音发送失败，关掉通道并回到唤醒");
+                    if (protocol_) {
+                        protocol_->CloseAudioChannel();
+                    }
+                    auto failed_state = GetDeviceState();
+                    if (failed_state == kDeviceStateListening ||
+                        failed_state == kDeviceStateSpeaking ||
+                        failed_state == kDeviceStateConnecting) {
+                        SetDeviceState(kDeviceStateIdle);
+                    }
                     break;
                 }
             }
@@ -272,6 +286,27 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+
+            // 通道断了还停在聆听时，唤醒词是关的，板子会一直没反应。回到待机重新打开唤醒。
+            auto channel_state = GetDeviceState();
+            if ((channel_state == kDeviceStateListening ||
+                 channel_state == kDeviceStateSpeaking) &&
+                protocol_ && !protocol_->IsAudioChannelOpened()) {
+                ESP_LOGW(TAG, "语音通道已断，回到唤醒");
+                protocol_->CloseAudioChannel();
+                SetDeviceState(kDeviceStateIdle);
+            }
+
+            // 说完只再听几秒。有人接着说就回答；一直没人说就关掉，避免旁边聊天被接话。
+            if (GetDeviceState() == kDeviceStateListening &&
+                listening_mode_ == kListeningModeAutoStop && !pending_listening_start_) {
+                if (IsVoiceDetected()) {
+                    followup_silence_ticks_ = 0;
+                } else if (++followup_silence_ticks_ >= 12) {
+                    ESP_LOGI(TAG, "follow-up window ended, back to wake word");
+                    ReturnToWakeWord();
+                }
+            }
 
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -320,6 +355,8 @@ void Application::HandleNetworkDisconnectedEvent() {
         state == kDeviceStateSpeaking) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
         protocol_->CloseAudioChannel();
+        // 关掉套接字不会自动回到待机。停在聆听时唤醒词是关的，必须显式回到唤醒。
+        SetDeviceState(kDeviceStateIdle);
     }
 
     // Update the status bar immediately to show the network state
@@ -335,20 +372,28 @@ void Application::HandleActivationDoneEvent() {
 
     has_server_time_ = ota_->HasServerTime();
 
-    auto display = Board::GetInstance().GetDisplay();
-    std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
-    display->ShowNotification(message.c_str());
-    display->SetChatMessage("system", "");
+    // Protocol start may have already raised MAIN_EVENT_ERROR. Do not replace
+    // that alert with the "ready" UI/sound — the main loop can process both
+    // events back-to-back because the activation task is lower priority.
+    const bool has_error = !last_error_message_.empty();
+    if (!has_error) {
+        auto display = Board::GetInstance().GetDisplay();
+        std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
+        display->ShowNotification(message.c_str());
+        display->SetChatMessage("system", "");
+    }
 
     // Release OTA object after activation is complete
     ota_.reset();
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
 
-    Schedule([this]() {
-        // Play the success sound to indicate the device is ready
-        audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
-    });
+    if (!has_error) {
+        Schedule([this]() {
+            // Play the success sound to indicate the device is ready
+            audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
+        });
+    }
 }
 
 void Application::ActivationTask() {
@@ -438,21 +483,21 @@ void Application::CheckNewVersion() {
         auto display = board.GetDisplay();
         display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
 
-        esp_err_t err = ota_->CheckVersion();
-        if (err != ESP_OK) {
+        auto check = ota_->CheckVersion();
+        if (!check) {
             retry_count++;
             if (retry_count >= MAX_RETRY) {
                 ESP_LOGE(TAG, "Too many retries, exit version check");
                 return;
             }
 
-            char error_message[128];
+            const auto& err = check.error();
+            char error_message[160];
             int error_message_length =
-                snprintf(error_message, sizeof(error_message), "code=%d, url=%s", err,
-                         ota_->GetCheckVersionUrl().c_str());
+                snprintf(error_message, sizeof(error_message), "%s", err.ToString().c_str());
             if (error_message_length < 0 ||
                 error_message_length >= static_cast<int>(sizeof(error_message))) {
-                snprintf(error_message, sizeof(error_message), "code=%d", err);
+                snprintf(error_message, sizeof(error_message), "%s", err.Message());
             }
 
             char buffer[320];
@@ -461,7 +506,7 @@ void Application::CheckNewVersion() {
                          retry_delay, error_message);
             if (alert_message_length < 0 ||
                 alert_message_length >= static_cast<int>(sizeof(buffer))) {
-                snprintf(buffer, sizeof(buffer), "code=%d", err);
+                snprintf(buffer, sizeof(buffer), "%s", err.Message());
             }
             Alert(Lang::Strings::ERROR, buffer, "cloud_off", Lang::Sounds::OGG_EXCLAMATION);
 
@@ -621,6 +666,7 @@ void Application::InitializeProtocol() {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
+                            followup_silence_ticks_ = 0;
                             SetDeviceState(kDeviceStateListening);
                         }
                     }
@@ -692,12 +738,16 @@ void Application::InitializeProtocol() {
 #if CONFIG_RECEIVE_CUSTOM_MESSAGE
         } else if (strcmp(type->valuestring, "custom") == 0) {
             auto payload = cJSON_GetObjectItem(root, "payload");
-            ESP_LOGI(TAG, "Received custom message: %s", cJSON_PrintUnformatted(root));
+            CJsonStringUniquePtr root_json(cJSON_PrintUnformatted(root));
+            ESP_LOGI(TAG, "Received custom message: %s", root_json ? root_json.get() : "");
             if (cJSON_IsObject(payload)) {
-                Schedule(
-                    [this, display, payload_str = std::string(cJSON_PrintUnformatted(payload))]() {
-                        display->SetChatMessage("system", payload_str.c_str());
-                    });
+                CJsonStringUniquePtr payload_json(cJSON_PrintUnformatted(payload));
+                if (payload_json) {
+                    Schedule(
+                        [this, display, payload_str = std::string(payload_json.get())]() {
+                            display->SetChatMessage("system", payload_str.c_str());
+                        });
+                }
             } else {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
             }
@@ -721,17 +771,74 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
          digit_sound{'4', Lang::Sounds::OGG_4}, digit_sound{'5', Lang::Sounds::OGG_5},
          digit_sound{'6', Lang::Sounds::OGG_6}, digit_sound{'7', Lang::Sounds::OGG_7},
          digit_sound{'8', Lang::Sounds::OGG_8}, digit_sound{'9', Lang::Sounds::OGG_9}}};
+    static const char* kChineseDigits[] = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
 
-    // This sentence uses 9KB of SRAM, so we need to wait for it to finish
-    Alert(Lang::Strings::ACTIVATION, message.c_str(), "link", Lang::Sounds::OGG_ACTIVATION);
+    ESP_LOGI(TAG, "Activation code: %s", code.c_str());
+    Board::GetInstance().OnActivationCode(code, message);
 
-    for (const auto& digit : code) {
-        auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
-                               [digit](const digit_sound& ds) { return ds.digit == digit; });
-        if (it != digit_sounds.end()) {
-            audio_service_.PlaySound(it->sound);
+    std::string chinese_digits;
+    chinese_digits.reserve(code.size() * 3);
+    for (char c : code) {
+        if (c >= '0' && c <= '9') {
+            chinese_digits += kChineseDigits[c - '0'];
+        } else {
+            chinese_digits.push_back(c);
         }
     }
+
+    // Include raw code so SetChatMessage / any display can show digits
+    std::string alert_message = message;
+    if (!code.empty()) {
+        if (!alert_message.empty()) {
+            alert_message += " 验证码 ";
+        } else {
+            alert_message = "验证码 ";
+        }
+        alert_message += code;
+    }
+
+    // This sentence uses 9KB of SRAM, so we need to wait for it to finish
+    Alert(Lang::Strings::ACTIVATION, alert_message.c_str(), "link", Lang::Sounds::OGG_ACTIVATION);
+
+    auto wait_playback_idle = [this](int fallback_ms) {
+        // Prefer draining the playback queue; fall back to a fixed gap if stuck.
+        constexpr int kPollMs = 50;
+        constexpr int kMaxWaitMs = 5000;
+        int waited = 0;
+        while (waited < kMaxWaitMs) {
+            if (audio_service_.IsPlaybackIdle()) {
+                return;
+            }
+            vTaskDelay(pdMS_TO_TICKS(kPollMs));
+            waited += kPollMs;
+        }
+        vTaskDelay(pdMS_TO_TICKS(fallback_ms));
+    };
+
+    auto play_digits_once = [&]() {
+        for (const auto& digit : code) {
+            wait_playback_idle(900);
+            auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
+                                   [digit](const digit_sound& ds) { return ds.digit == digit; });
+            if (it != digit_sounds.end()) {
+                audio_service_.PlaySound(it->sound);
+            }
+            // 600ms gap after each digit idle so digits do not blend
+            wait_playback_idle(600);
+            vTaskDelay(pdMS_TO_TICKS(600));
+        }
+        wait_playback_idle(900);
+    };
+
+    // Wait for OGG_ACTIVATION prompt to finish, then speak digits twice for clarity
+    wait_playback_idle(1000);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    play_digits_once();
+    vTaskDelay(pdMS_TO_TICKS(800));
+    play_digits_once();
+
+    // TTS fallback / reinforcement in Chinese digits (cloud) after OGG
+    WakeWordInvoke(std::string("[device_call]请在智控台输入验证码，") + chinese_digits);
 }
 
 void Application::Alert(const char* status, const char* message, const char* emotion,
@@ -747,6 +854,7 @@ void Application::Alert(const char* status, const char* message, const char* emo
 }
 
 void Application::DismissAlert() {
+    last_error_message_.clear();
     if (GetDeviceState() == kDeviceStateIdle) {
         auto display = Board::GetInstance().GetDisplay();
         display->SetStatus(Lang::Strings::STANDBY);
@@ -893,6 +1001,12 @@ void Application::HandleWakeWordDetectedEvent() {
         StopNotification();
         BeginWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+        if (!protocol_->IsAudioChannelOpened()) {
+            ESP_LOGW(TAG, "唤醒时通道已断，重新连接");
+            SetDeviceState(kDeviceStateIdle);
+            BeginWakeWordInvoke(wake_word);
+            return;
+        }
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
         while (audio_service_.PopPacketFromSendQueue())
@@ -967,12 +1081,22 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     }
     // Set the chat state to wake word detected
     protocol_->SendWakeWordDetected(wake_word);
+    // 保护窗：覆盖服务端秒回「我在」+ 喇叭回声，避免立刻 abort 导致唤不醒体感
+    wake_reply_protect_until_us_ = esp_timer_get_time() + 2500000LL;
     SetListeningMode(GetDefaultListeningMode());
 #else
-    // Set flag to play popup sound after state changes to listening
-    // (PlaySound here would be cleared by ResetDecoder in EnableVoiceProcessing)
-    play_popup_on_listening_ = true;
-    SetListeningMode(GetDefaultListeningMode());
+    // LXP 报单/欢迎播报：无端侧唤醒词数据时，仍必须把 [device_call] 文本发给服务器做 TTS
+    if (wake_word.rfind("[device_call]", 0) == 0) {
+        protocol_->SendWakeWordDetected(wake_word);
+        wake_reply_protect_until_us_ = esp_timer_get_time() + 2500000LL;
+        SetListeningMode(GetDefaultListeningMode());
+    } else {
+        // Set flag to play popup sound after state changes to listening
+        // (PlaySound here would be cleared by ResetDecoder in EnableVoiceProcessing)
+        play_popup_on_listening_ = true;
+        wake_reply_protect_until_us_ = esp_timer_get_time() + 2500000LL;
+        SetListeningMode(GetDefaultListeningMode());
+    }
 #endif
 }
 
@@ -982,6 +1106,7 @@ void Application::HandleStateChangedEvent() {
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
     pending_listening_start_ = false;
+    followup_silence_ticks_ = 0;
 
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
@@ -991,9 +1116,15 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
-            display->SetStatus(Lang::Strings::STANDBY);
-            display->ClearChatMessages();    // Clear messages first
-            display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
+            // Keep a just-raised network error visible. SetDeviceState(idle)
+            // queues STATE_CHANGED after Alert(), and the idle handler would
+            // otherwise wipe the status, emotion, and chat message.
+            if (last_error_message_.empty()) {
+                display->SetStatus(Lang::Strings::STANDBY);
+                display->ClearChatMessages();  // Clear messages first
+                display->SetEmotion(
+                    "neutral");  // Then set emotion (wechat mode checks child count)
+            }
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
             break;
@@ -1044,6 +1175,19 @@ void Application::HandleStateChangedEvent() {
             // Do nothing
             break;
     }
+}
+
+void Application::ReturnToWakeWord() {
+    pending_listening_start_ = false;
+    followup_silence_ticks_ = 0;
+    if (GetDeviceState() != kDeviceStateListening && GetDeviceState() != kDeviceStateSpeaking) {
+        return;
+    }
+    // 只停聆听，不拆掉语音通道。直接掐断连接会让下一句「你好小智」也不再响应。
+    if (protocol_) {
+        protocol_->SendStopListening();
+    }
+    SetDeviceState(kDeviceStateIdle);
 }
 
 void Application::StartListeningAudio() {
@@ -1151,6 +1295,15 @@ void Application::Schedule(std::function<void()>&& callback) {
 }
 
 void Application::AbortSpeaking(AbortReason reason) {
+    // 唤醒后短应答「我在」播放中，回声/状态切换易误发 abort，用户会以为没唤醒成功
+    if (reason != kAbortReasonWakeWordDetected && wake_reply_protect_until_us_ > 0) {
+        const int64_t now = esp_timer_get_time();
+        if (now < wake_reply_protect_until_us_) {
+            ESP_LOGI(TAG, "Ignore abort during wake-reply protect (%lld ms left)",
+                     (long long)((wake_reply_protect_until_us_ - now) / 1000));
+            return;
+        }
+    }
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
     if (protocol_) {
@@ -1242,6 +1395,42 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     }
 }
 
+void Application::ScheduleDeviceCallWhenIdle(const std::string& wake_word) {
+    struct Ctx {
+        Application* app;
+        std::string word;
+    };
+    auto* ctx = new Ctx{this, wake_word};
+    if (xTaskCreate(
+            [](void* arg) {
+                auto* c = static_cast<Ctx*>(arg);
+                bool sent = false;
+                for (int i = 0; i < 80 && !sent; ++i) {
+                    if (c->app->GetDeviceState() == kDeviceStateIdle) {
+                        Application* app = c->app;
+                        std::string word = c->word;
+                        app->Schedule([app, word]() {
+                            if (app->GetDeviceState() == kDeviceStateIdle) {
+                                app->BeginWakeWordInvoke(word);
+                            }
+                        });
+                        sent = true;
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (!sent) {
+                    ESP_LOGW(TAG, "device_call dropped, state=%d", (int)c->app->GetDeviceState());
+                }
+                delete c;
+                vTaskDelete(nullptr);
+            },
+            "devcall", 4096, ctx, 2, nullptr) != pdPASS) {
+        delete ctx;
+        ESP_LOGE(TAG, "device_call task create failed");
+    }
+}
+
 void Application::WakeWordInvoke(const std::string& wake_word) {
     if (!protocol_) {
         return;
@@ -1252,9 +1441,12 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     if (state == kDeviceStateIdle) {
         // May be called from outside the main task (e.g. board button
         // callbacks), so schedule the invocation instead of running it here
-        Schedule([this, wake_word]() {
+        const bool device_call = wake_word.rfind("[device_call]", 0) == 0;
+        Schedule([this, wake_word, device_call]() {
             if (GetDeviceState() == kDeviceStateIdle) {
                 BeginWakeWordInvoke(wake_word);
+            } else if (device_call) {
+                ScheduleDeviceCallWhenIdle(wake_word);
             }
         });
     } else if (state == kDeviceStateNotifying) {
@@ -1265,13 +1457,29 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
             }
         });
     } else if (state == kDeviceStateSpeaking) {
-        Schedule([this]() { AbortSpeaking(kAbortReasonNone); });
+        // 报单不要在主循环里空等。先打断，再由独立任务等到 Idle 后开播。
+        if (wake_word.rfind("[device_call]", 0) == 0) {
+            Schedule([this]() { AbortSpeaking(kAbortReasonNone); });
+            ScheduleDeviceCallWhenIdle(wake_word);
+        } else {
+            Schedule([this]() { AbortSpeaking(kAbortReasonNone); });
+        }
     } else if (state == kDeviceStateListening) {
-        Schedule([this]() {
-            if (protocol_) {
-                protocol_->CloseAudioChannel();
-            }
-        });
+        // 上一条报单说完会停在 Listening。关掉听单通道，等到 Idle 再播下一条。
+        if (wake_word.rfind("[device_call]", 0) == 0) {
+            Schedule([this]() {
+                if (protocol_) {
+                    protocol_->CloseAudioChannel();
+                }
+            });
+            ScheduleDeviceCallWhenIdle(wake_word);
+        } else {
+            Schedule([this]() {
+                if (protocol_) {
+                    protocol_->CloseAudioChannel();
+                }
+            });
+        }
     }
 }
 

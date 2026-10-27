@@ -1,5 +1,6 @@
 #include "wifi_board.h"
 #include "audio/codecs/box_audio_codec.h"
+#include "audio/codecs/es8388_audio_codec.h"
 #include "display/lcd_display.h"
 #include "application.h"
 #include "button.h"
@@ -9,10 +10,14 @@
 #include "esp32_camera.h"
 #include "assets/lang_config.h"
 
+#include <sdkconfig.h>
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
+#include <driver/gpio.h>
 #include <wifi_station.h>
 #include "power_manager.h"
 #include <esp_lvgl_port.h>
@@ -104,15 +109,22 @@ private:
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
 
-        // Initialize PCA9557
+        ESP_LOGI(TAG, "Frido zhengchen-cam, OTA %s", CONFIG_OTA_URL);
+        for (uint8_t addr = 0x08; addr < 0x78; ++addr) {
+            if (i2c_master_probe(i2c_bus_, addr, 20) == ESP_OK) {
+                ESP_LOGI(TAG, "I2C device 0x%02x", addr);
+            }
+        }
+
+        // Initialize PCA9557. A missing ACK must not reboot the board.
         pca9557_ = new Pca9557(i2c_bus_, 0x19);
     }
 
     void InitializeSpi() {
         spi_bus_config_t buscfg = {};
-        buscfg.mosi_io_num = GPIO_NUM_40;
+        buscfg.mosi_io_num = GPIO_NUM_39;
         buscfg.miso_io_num = GPIO_NUM_NC;
-        buscfg.sclk_io_num = GPIO_NUM_41;
+        buscfg.sclk_io_num = GPIO_NUM_40;
         buscfg.quadwp_io_num = GPIO_NUM_NC;
         buscfg.quadhd_io_num = GPIO_NUM_NC;
         buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
@@ -194,10 +206,10 @@ private:
         // 液晶屏控制IO初始化
         ESP_LOGD(TAG, "Install panel IO");
         esp_lcd_panel_io_spi_config_t io_config = {};
-        io_config.cs_gpio_num = GPIO_NUM_NC;
-        io_config.dc_gpio_num = GPIO_NUM_39;
+        io_config.cs_gpio_num = DISPLAY_CS_PIN;
+        io_config.dc_gpio_num = DISPLAY_DC_PIN;
         io_config.spi_mode = 0;
-        io_config.pclk_hz = 80 * 1000 * 1000;
+        io_config.pclk_hz = 10 * 1000 * 1000;
         io_config.trans_queue_depth = 10;
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
@@ -206,15 +218,14 @@ private:
         // 初始化液晶屏驱动芯片ST7789
         ESP_LOGD(TAG, "Install LCD driver");
         esp_lcd_panel_dev_config_t panel_config = {};
-        panel_config.reset_gpio_num = GPIO_NUM_NC;
+        panel_config.reset_gpio_num = DISPLAY_RST_PIN;
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
         ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
         
         esp_lcd_panel_reset(panel);
-        pca9557_->SetOutputState(0, 0);
-
-        esp_lcd_panel_init(panel);
+        vTaskDelay(pdMS_TO_TICKS(120));
+        ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
         esp_lcd_panel_invert_color(panel, true);
 
         Settings settings("lcd_display", true);
@@ -289,9 +300,13 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static CustomAudioCodec audio_codec(
-            i2c_bus_, 
-            pca9557_);
+        // 视觉 Mini 总线上是 ES8388（7 位地址 0x10），没有 ES8311 / PCA9557。
+        static Es8388AudioCodec audio_codec(
+            i2c_bus_, I2C_NUM_1,
+            AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS,
+            AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
+            GPIO_NUM_NC, ES8388_CODEC_DEFAULT_ADDR, false);
         return &audio_codec;
     }
 

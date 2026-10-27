@@ -1,0 +1,48 @@
+#ifndef _BOARD_CONFIG_H_
+#define _BOARD_CONFIG_H_
+
+#include <driver/gpio.h>
+#include <driver/uart.h>
+
+// 邻小铺报单终端 · ESP32-S3 N16R8
+// 注意：S3 无 GPIO22/23/25，不能沿用经典 ESP32 脚位。
+
+#define AUDIO_INPUT_SAMPLE_RATE  16000
+// 与 Opus/ASR 同频，避免 TTS 重采样引入杂音
+#define AUDIO_OUTPUT_SAMPLE_RATE 16000
+
+#define AUDIO_I2S_METHOD_SIMPLEX
+
+// 麦 INMP441（I2S）
+#define AUDIO_I2S_MIC_GPIO_WS   GPIO_NUM_1
+#define AUDIO_I2S_MIC_GPIO_SCK  GPIO_NUM_2
+#define AUDIO_I2S_MIC_GPIO_DIN  GPIO_NUM_42
+
+// 喇叭 MAX98357（I2S）— 2026-09 改脚：原 39/40/41 若无声请改接本组
+#define AUDIO_I2S_SPK_GPIO_DOUT GPIO_NUM_21
+#define AUDIO_I2S_SPK_GPIO_BCLK GPIO_NUM_17
+#define AUDIO_I2S_SPK_GPIO_LRCK GPIO_NUM_18
+// SD/SDN：固件拉高强制开功放（勿接 GND；接本脚或悬空）
+#define AUDIO_I2S_SPK_GPIO_SD   GPIO_NUM_14
+
+#define BOOT_BUTTON_GPIO        GPIO_NUM_0
+
+// WS2812 灯环（S3 无 GPIO23，改用 48）
+#define BUILTIN_LED_GPIO        GPIO_NUM_48
+#define BUILTIN_LED_NUM         24
+
+// HC-SR501 回退
+#define LXP_PIR_GPIO            GPIO_NUM_4
+
+// HLK-LD2450：模块 TX → GPIO16
+#define LXP_LD2450_ENABLE       1
+#define LXP_LD2450_UART_NUM     UART_NUM_1
+#define LXP_LD2450_RX_GPIO      GPIO_NUM_16
+#define LXP_LD2450_TX_GPIO      GPIO_NUM_NC
+#define LXP_LD2450_BAUD         256000
+#define LXP_LD2450_WELCOME_MAX_MM  2500
+
+#define DISPLAY_WIDTH   0
+#define DISPLAY_HEIGHT  0
+
+#endif // _BOARD_CONFIG_H_

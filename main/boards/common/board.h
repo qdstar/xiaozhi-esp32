@@ -67,6 +67,8 @@ public:
     virtual ~Board() = default;
     virtual std::string GetBoardType() = 0;
     virtual std::string GetUuid() { return uuid_; }
+    /** Regenerate Client-Id (uuid) so the next OTA check can request a new activation code. */
+    void ResetUuid();
     virtual Backlight* GetBacklight() { return nullptr; }
     virtual Led* GetLed();
     virtual AudioCodec* GetAudioCodec() = 0;
@@ -82,6 +84,11 @@ public:
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;
     virtual std::string GetDeviceStatusJson() = 0;
+    /** 智控台验证码下发时回调（无屏板可上报到商户后台大字展示） */
+    virtual void OnActivationCode(const std::string& code, const std::string& message) {
+        (void)code;
+        (void)message;
+    }
 };
 
 #define DECLARE_BOARD(BOARD_CLASS_NAME) \

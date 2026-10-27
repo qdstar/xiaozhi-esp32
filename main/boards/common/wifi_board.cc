@@ -5,6 +5,7 @@
 #include "system_info.h"
 #include "settings.h"
 #include "assets/lang_config.h"
+#include "ota.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -45,6 +46,13 @@ WifiBoard::~WifiBoard() {
     }
 }
 
+WifiLxpClaimResult WifiBoard::OnLxpShopClaim(const std::string& /*pairing_code*/) {
+    WifiLxpClaimResult r;
+    r.ok = false;
+    r.message = "本板型不支持邻小铺绑店";
+    return r;
+}
+
 std::string WifiBoard::GetBoardType() {
     return "wifi";
 }
@@ -54,7 +62,7 @@ void WifiBoard::StartNetwork() {
 
     // Initialize WiFi manager
     WifiManagerConfig config;
-    config.ssid_prefix = "Xiaozhi";
+    config.ssid_prefix = GetSsidPrefix();
     config.language = Lang::CODE;
     config.show_ota_config = true;
     config.show_sleep_config = true;
@@ -68,6 +76,32 @@ void WifiBoard::StartNetwork() {
         config.station_hostname = hostname;
     }
     wifi_manager.Initialize(config);
+
+    if (PrefetchActivationOnWifiConfig()) {
+        wifi_manager.SetActivationFetchCallback([]() -> WifiActivationInfo {
+            WifiActivationInfo info;
+            Ota ota;
+            auto check = ota.CheckVersion();
+            if (!check) {
+                ESP_LOGW(TAG, "Activation prefetch CheckVersion failed");
+                return info;
+            }
+            if (ota.HasActivationCode()) {
+                info.code = ota.GetActivationCode();
+                info.message = ota.GetActivationMessage();
+                ESP_LOGI(TAG, "Prefetched activation code for captive portal");
+            } else {
+                ESP_LOGI(TAG, "OTA check OK but no activation code (already bound?)");
+            }
+            return info;
+        });
+    }
+
+    if (EnableLxpShopClaimOnWifiConfig()) {
+        wifi_manager.SetLxpClaimCallback([this](const std::string& pairing_code) -> WifiLxpClaimResult {
+            return OnLxpShopClaim(pairing_code);
+        });
+    }
 
     // Set unified event callback - forward to NetworkEvent with SSID data
     wifi_manager.SetEventCallback([this](WifiEvent event, const std::string& data) {
@@ -199,39 +233,40 @@ void WifiBoard::EnterWifiConfigMode() {
     auto& app = Application::GetInstance();
     auto state = app.GetDeviceState();
 
-    if (state == kDeviceStateSpeaking || state == kDeviceStateNotifying ||
-        state == kDeviceStateListening || state == kDeviceStateIdle) {
-        // Reset protocol (close audio channel, reset protocol)
-        Application::GetInstance().ResetProtocol();
+    if (state == kDeviceStateWifiConfiguring) {
+        ESP_LOGW(TAG, "Already in WiFi config mode");
+        return;
+    }
 
-        xTaskCreate([](void* arg) {
+    OnEnterWifiConfigMode();
+
+    // Activating 卡在官方 OTA 时也必须能进配网；先落到 Idle 打断激活循环
+    if (state == kDeviceStateActivating) {
+        ESP_LOGW(TAG, "Abort activating to enter WiFi config");
+        app.SetDeviceState(kDeviceStateIdle);
+        state = kDeviceStateIdle;
+    }
+
+    if (state == kDeviceStateStarting) {
+        esp_timer_stop(connect_timer_);
+        WifiManager::GetInstance().StopStation();
+        StartWifiConfigMode();
+        return;
+    }
+
+    // Idle / Listening / Speaking / Connecting / Notifying / … 均可重新配网
+    Application::GetInstance().ResetProtocol();
+
+    xTaskCreate(
+        [](void* arg) {
             auto* board = static_cast<WifiBoard*>(arg);
-
-            // Wait for 1 second to allow speaking to finish gracefully
-            vTaskDelay(pdMS_TO_TICKS(1000));
-
-            // Stop any ongoing connection attempt
+            vTaskDelay(pdMS_TO_TICKS(500));
             esp_timer_stop(board->connect_timer_);
             WifiManager::GetInstance().StopStation();
-
-            // Enter config mode
             board->StartWifiConfigMode();
-
             vTaskDelete(NULL);
-        }, "wifi_cfg_delay", 4096, this, 2, NULL);
-        return;
-    }
-
-    if (state != kDeviceStateStarting) {
-        ESP_LOGE(TAG, "EnterWifiConfigMode called but device state is not starting or speaking, device state: %d", state);
-        return;
-    }
-
-    // Stop any ongoing connection attempt
-    esp_timer_stop(connect_timer_);
-    WifiManager::GetInstance().StopStation();
-
-    StartWifiConfigMode();
+        },
+        "wifi_cfg_delay", 4096, this, 2, NULL);
 }
 
 bool WifiBoard::IsInWifiConfigMode() const {

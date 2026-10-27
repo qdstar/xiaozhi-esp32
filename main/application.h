@@ -148,9 +148,11 @@ private:
 
     bool has_server_time_ = false;
     bool aborted_ = false;
+    int64_t wake_reply_protect_until_us_ = 0;  // 唤醒应答保护窗，忽略回声 abort
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
+    int followup_silence_ticks_ = 0;  // 说完后的短聆听，连续静音这么多秒就回唤醒词
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
@@ -166,8 +168,12 @@ private:
     void HandleWakeWordDetectedEvent();
     void ContinueOpenAudioChannel(ListeningMode mode);
     void BeginWakeWordInvoke(const std::string& wake_word);
+    /** 关通道/打断之后在独立任务里等到 Idle，再开 [device_call]，避免主循环空等把播报丢掉 */
+    void ScheduleDeviceCallWhenIdle(const std::string& wake_word);
     void ContinueWakeWordInvoke(const std::string& wake_word);
     void StartListeningAudio();
+    /** 当前这句话说完就关通道回到待机，避免旁边聊天被当成对它说话 */
+    void ReturnToWakeWord();
     void ConfigureWakeWordForListening();
     void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
     void StopNotification();

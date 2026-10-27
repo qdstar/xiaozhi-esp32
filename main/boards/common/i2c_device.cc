@@ -1,6 +1,8 @@
 #include "i2c_device.h"
 
 #include <esp_log.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define TAG "I2cDevice"
 
@@ -22,17 +24,41 @@ I2cDevice::I2cDevice(i2c_master_bus_handle_t i2c_bus, uint8_t addr)
 
 void I2cDevice::WriteReg(uint8_t reg, uint8_t value) {
     uint8_t buffer[2] = {reg, value};
-    ESP_ERROR_CHECK(i2c_master_transmit(i2c_device_, buffer, 2, 100));
+    esp_err_t err = i2c_master_transmit(i2c_device_, buffer, 2, 100);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WriteReg 0x%02x reg 0x%02x failed: %s", device_address_, reg, esp_err_to_name(err));
+    }
+}
+
+void I2cDevice::WriteRegs(uint8_t reg, const uint8_t* buffer, size_t length) {
+    uint8_t* tx = (uint8_t*)malloc(length + 1);
+    if (tx == nullptr) {
+        return;
+    }
+    tx[0] = reg;
+    memcpy(tx + 1, buffer, length);
+    esp_err_t err = i2c_master_transmit(i2c_device_, tx, length + 1, 100);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WriteRegs 0x%02x reg 0x%02x failed: %s", device_address_, reg, esp_err_to_name(err));
+    }
+    free(tx);
 }
 
 uint8_t I2cDevice::ReadReg(uint8_t reg) {
-    uint8_t buffer[1];
-    ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, 1, 100));
+    uint8_t buffer[1] = {0};
+    esp_err_t err = i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, 1, 100);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ReadReg 0x%02x reg 0x%02x failed: %s", device_address_, reg, esp_err_to_name(err));
+        return 0;
+    }
     return buffer[0];
 }
 
 void I2cDevice::ReadRegs(uint8_t reg, uint8_t* buffer, size_t length) {
-    ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, 100));
+    esp_err_t err = i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, 100);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ReadRegs 0x%02x reg 0x%02x failed: %s", device_address_, reg, esp_err_to_name(err));
+    }
 }
 
 esp_err_t I2cDevice::ResetBus(const char* reason) {

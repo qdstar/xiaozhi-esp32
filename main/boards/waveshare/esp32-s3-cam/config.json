@@ -12,7 +12,8 @@
         "sdkconfig_append": [
             "CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_CAM_XXXX=y",
             "CONFIG_USE_DEVICE_AEC=y",
-            "CONFIG_BSP_LCD_SIZE_2INCH=y"
+            "CONFIG_BSP_LCD_SIZE_2INCH=y",
+            "CONFIG_OTA_URL=\"https://xiao2.complote.com/xiaozhi/ota/\""
         ]
     },
     {

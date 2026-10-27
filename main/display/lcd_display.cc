@@ -5,6 +5,7 @@
 #include "settings.h"
 
 #include <esp_err.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
@@ -124,6 +125,34 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     // lv image cache, currently only PNG is supported
     size_t psram_size_mb = esp_psram_get_size() / 1024 / 1024;
     if (psram_size_mb >= 8) {
+#if CONFIG_LV_USE_BUILTIN_MALLOC
+        // Base TLSF pool is CONFIG_LV_MEM_SIZE_KILOBYTES in PSRAM; grow it so
+        // the 2MB decoded-image cache does not exhaust a 2MB-PSRAM-safe pool.
+        // TLSF rejects any single pool larger than LV_MEM_SIZE when
+        // LV_MEM_POOL_EXPAND_SIZE is 0 (block_size_max = 1 << ceil(log2(LV_MEM_SIZE))).
+        const size_t extra_total = 2560 * 1024;
+        const size_t chunk_size = LV_MEM_SIZE;
+        size_t added = 0;
+        while (added < extra_total) {
+            size_t this_chunk = extra_total - added;
+            if (this_chunk > chunk_size) {
+                this_chunk = chunk_size;
+            }
+            void* pool = heap_caps_malloc(this_chunk, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (pool == nullptr || lv_mem_add_pool(pool, this_chunk) == nullptr) {
+                if (pool != nullptr) {
+                    heap_caps_free(pool);
+                }
+                ESP_LOGE(TAG, "Failed to add %uKB LVGL PSRAM pool (added %uKB)",
+                         (unsigned)(this_chunk / 1024), (unsigned)(added / 1024));
+                break;
+            }
+            added += this_chunk;
+        }
+        if (added == extra_total) {
+            ESP_LOGI(TAG, "Added %uKB LVGL pool in PSRAM", (unsigned)(added / 1024));
+        }
+#endif
         lv_image_cache_resize(2 * 1024 * 1024, true);
         ESP_LOGI(TAG, "Use 2MB of PSRAM for image cache");
     } else if (psram_size_mb >= 2) {
@@ -141,6 +170,9 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     lvgl_port_init(&port_cfg);
 
     ESP_LOGI(TAG, "Adding LCD display");
+    // SPI LCD still needs an internal DMA bounce buffer for PSRAM sources.
+    // A full-frame transfer (~150KB) cannot allocate that bounce buffer, so
+    // keep a small DMA strip in internal SRAM and partial refresh.
     const lvgl_port_display_cfg_t display_cfg = {
         .io_handle = panel_io_,
         .panel_handle = panel_,
@@ -351,6 +383,15 @@ LcdDisplay::~LcdDisplay() {
 bool LcdDisplay::Lock(int timeout_ms) { return lvgl_port_lock(timeout_ms); }
 
 void LcdDisplay::Unlock() { lvgl_port_unlock(); }
+
+void LcdDisplay::SetShopBoard(const char* text) {
+    DisplayLockGuard lock(this);
+    if (shop_board_label_ == nullptr || text == nullptr || text[0] == '\0') {
+        return;
+    }
+    lv_label_set_text(shop_board_label_, text);
+    lv_obj_remove_flag(shop_board_label_, LV_OBJ_FLAG_HIDDEN);
+}
 
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
 void LcdDisplay::SetupUI() {
@@ -854,6 +895,18 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
     lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
+
+    shop_board_label_ = lv_label_create(screen);
+    lv_obj_set_width(shop_board_label_, LV_HOR_RES - 24);
+    lv_label_set_long_mode(shop_board_label_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(shop_board_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(shop_board_label_, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(shop_board_label_, lv_color_hex(0x0B3D2E), 0);
+    lv_obj_set_style_bg_opa(shop_board_label_, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(shop_board_label_, 8, 0);
+    lv_label_set_text(shop_board_label_, "邻小铺\n店铺看板\n等待新订单");
+    lv_obj_align(shop_board_label_, LV_ALIGN_CENTER, 0, 16);
+    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);

@@ -34,7 +34,7 @@
 #define DISPLAY_DC_PIN              GPIO_NUM_3
 #define DISPLAY_RESET_PIN           GPIO_NUM_NC
 #define DISPLAY_BACKLIGHT_PIN       GPIO_NUM_NC
-#define DISPLAY_SPI_SCLK_HZ         (40 * 1000 * 1000)
+#define DISPLAY_SPI_SCLK_HZ         (20 * 1000 * 1000)
 
 
 /* Camera pins */

@@ -6,6 +6,7 @@
         {
             "name": "zhengchen-cam",
             "sdkconfig_append": [
+                "CONFIG_OTA_URL=\"https://api.tenclass.net/xiaozhi/ota/\"",
                 "CONFIG_USE_DEVICE_AEC=y",
 				"CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=48",
 				"CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32",
